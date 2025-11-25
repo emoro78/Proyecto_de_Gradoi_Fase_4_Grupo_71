@@ -1,0 +1,136 @@
+
+## Cómo replicar el laboratorio (paso a paso)
+
+1. Crear 3 VMs con Ubuntu Server 24.04 (mínimo 1 GB RAM cada una)
+2. En cada VM ejecutar:
+   ```bash
+   curl -fsSL https://tailscale.com/install.sh | sh
+   sudo tailscale up --auth-key=TU_CLAVE_AQUI
+
+
+#### 2. `firewall/configure_firewall.sh`
+
+```bash
+#!/bin/bash
+# Configuración Firewall Perimetral - Edwin Montoya
+# Laboratorio Ciberseguridad Funza - UNAD 2024
+
+set -e
+
+echo "=== Configurando Firewall Perimetral (UFW) ==="
+sudo apt update
+sudo apt install ufw -y
+
+# Política por defecto
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+
+# Solo permitir tráfico desde la red Tailscale (100.0.0.0/8)
+sudo ufw allow from 100.0.0.0/8 to any
+sudo ufw allow 22/tcp comment 'SSH solo desde Tailscale (se restringirá más adelante)'
+
+echo "Activando firewall..."
+sudo ufw --force enable
+
+echo "Estado final del firewall:"
+sudo ufw status verbose
+
+echo "=== Instalando y conectando Tailscale ==="
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --auth-key=tskey-auth-XXXXXXXXXXXXXXXXXXXXXXXX
+
+echo "IP Tailscale asignada:"
+tailscale ip -4
+
+echo "=== Firewall configurado y conectado a la VPN privada ==="
+
+#!/bin/bash
+# WAF + Reverse Proxy - Sergio Quintero
+# Nginx + ModSecurity + OWASP CRS
+
+set -e
+
+echo "=== Instalando Nginx + ModSecurity ==="
+sudo apt update
+sudo apt install nginx libnginx-mod-http-modsecurity -y
+
+echo "=== Descargando configuración ModSecurity recomendada ==="
+sudo mkdir -p /etc/nginx/modsec
+cd /etc/nginx/modsec
+
+sudo wget https://github.com/owasp-modsecurity/ModSecurity/raw/v3/master/modsecurity.conf-recommended -O modsecurity.conf
+sudo wget https://github.com/coreruleset/coreruleset/archive/v4.0.0-rc1.tar.gz
+sudo tar -xzf v4.0.0-rc1.tar.gz
+sudo mv coreruleset-4.0.0-rc1 crs
+
+# Activar modo bloqueo
+sudo sed -i 's/SecRuleEngine DetectionOnly/SecRuleEngine On/' modsecurity.conf
+
+echo "=== Configurando sitio con WAF ==="
+sudo tee /etc/nginx/sites-available/default > /dev/null <<'EOF'
+server {
+    listen 80;
+    server_name _;
+
+    ModSecurityEnabled on;
+    ModSecurityConfig /etc/nginx/modsec/modsecurity.conf;
+
+    location / {
+        proxy_pass http://100.115.31.50;  # IP Tailscale de la VM de aplicación/DB (ajustar)
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+EOF
+
+# Incluir reglas CRS
+sudo tee /etc/nginx/modsec/main.conf > /dev/null <<'EOF'
+Include /etc/nginx/modsec/modsecurity.conf
+Include /etc/nginx/modsec/crs/crs-setup.conf
+Include /etc/nginx/modsec/crs/rules/*.conf
+EOF
+
+sudo nginx -t && sudo systemctl restart nginx
+
+echo "=== Conectando a Tailscale ==="
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --auth-key=tskey-auth-XXXXXXXXXXXXXXXXXXXXXXXX
+
+echo "WAF activo y conectado a la VPN. ¡Prueba un SQLi!"
+echo "Ejemplo: curl 'http://TU_IP_TAILSCALE/?id=1 OR 1=1-- -'"
+
+
+#!/bin/bash
+# Base de Datos Segura - José Argemiro Romero
+# PostgreSQL con acceso restringido a red Tailscale
+
+set -e
+
+echo "=== Instalando PostgreSQL ==="
+sudo apt update
+sudo apt install postgresql postgresql-contrib -y
+
+echo "=== Creando base de datos segura ==="
+sudo -u postgres psql -c "CREATE DATABASE appdb;"
+sudo -u postgres psql -c "CREATE USER appuser WITH ENCRYPTED PASSWORD 'S3gur1d4d_2024!';"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE appdb TO appuser;"
+
+echo "=== Restringiendo acceso solo desde Tailscale (100.0.0.0/8) ==="
+sudo cp /etc/postgresql/*/main/pg_hba.conf /etc/postgresql/*/main/pg_hba.conf.bak
+
+sudo tee -a /etc/postgresql/*/main/pg_hba.conf > /dev/null <<EOF
+
+# Acceso solo desde red Tailscale
+host    all             all             100.0.0.0/8            scram-sha-256
+host    all             all             127.0.0.1/32           scram-sha-256
+EOF
+
+sudo systemctl restart postgresql
+
+echo "=== Conectando a Tailscale ==="
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --auth-key=tskey-auth-XXXXXXXXXXXXXXXXXXXXXXXX
+
+echo "Base de datos segura lista. IP Tailscale:"
+tailscale ip -4
+
