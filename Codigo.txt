@@ -1,136 +1,245 @@
+Cómo iniciar (simulación local con Docker)
 
-## Cómo replicar el laboratorio (paso a paso)
+1. Clonar el repo
 
-1. Crear 3 VMs con Ubuntu Server 24.04 (mínimo 1 GB RAM cada una)
-2. En cada VM ejecutar:
-   ```bash
-   curl -fsSL https://tailscale.com/install.sh | sh
-   sudo tailscale up --auth-key=TU_CLAVE_AQUI
+2. (Opcional) Descargar OWASP CRS:
 
+3. Levantar servicios:
 
-#### 2. `firewall/configure_firewall.sh`
+docker-compose up -d --build
+4. Verificar:
+- App: `http://localhost:8080` → lista de usuarios.
+- DB: `docker exec -it lab-db psql -U postgres -d seguridad_ciudadana -c "SELECT * FROM usuarios;"`
 
-```bash
-#!/bin/bash
-# Configuración Firewall Perimetral - Edwin Montoya
-# Laboratorio Ciberseguridad Funza - UNAD 2024
+## Scripts para VMs (Perímetro / VPN)
+Los scripts en `scripts/` están pensados para ejecutarse en VMs Ubuntu Server (no en contenedores).
 
-set -e
+**Referencia al Documento Maestro (Fase 3):**
+`/mnt/data/Fase 3 Formulación del proceso metodológico investigativo - Grupo 202016907_71.pdf`
 
-echo "=== Configurando Firewall Perimetral (UFW) ==="
-sudo apt update
-sudo apt install ufw -y
+---
 
-# Política por defecto
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
+## Documentación adicional
+Revisa `docs/resources.md` para enlaces a manuales (Tailscale, ModSecurity, PostgreSQL, UFW).
 
-# Solo permitir tráfico desde la red Tailscale (100.0.0.0/8)
-sudo ufw allow from 100.0.0.0/8 to any
-sudo ufw allow 22/tcp comment 'SSH solo desde Tailscale (se restringirá más adelante)'
+---
 
-echo "Activando firewall..."
-sudo ufw --force enable
+## Licencia
+MIT License. (Archivo LICENSE)
 
-echo "Estado final del firewall:"
-sudo ufw status verbose
+docker-compose.yml
+version: '3.8'
+services:
+  web:
+    build: ./app
+    container_name: lab-web
+    depends_on:
+      - db
+    volumes:
+      - ./app:/var/www/html
+    networks:
+      - labnet
+    ports:
+      - "8080:80"   # para pruebas locales
+    restart: unless-stopped
 
-echo "=== Instalando y conectando Tailscale ==="
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up --auth-key=tskey-auth-XXXXXXXXXXXXXXXXXXXXXXXX
+  nginx-waf:
+    image: nginx:1.22
+    container_name: lab-nginx-waf
+    depends_on:
+      - web
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/sites-enabled/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/modsecurity:/etc/nginx/modsecurity:ro
+      - ./nginx/modsecurity/crs:/etc/nginx/modsecurity/crs:ro
+    ports:
+      - "8081:80"   # WAF front-end (simulación)
+    networks:
+      - labnet
+    restart: unless-stopped
 
-echo "IP Tailscale asignada:"
-tailscale ip -4
+  db:
+    image: postgres:14
+    container_name: lab-db
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+    volumes:
+      - ./db/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    networks:
+      - labnet
+    restart: unless-stopped
 
-echo "=== Firewall configurado y conectado a la VPN privada ==="
+networks:
+  labnet:
+    driver: bridge
 
-#!/bin/bash
-# WAF + Reverse Proxy - Sergio Quintero
-# Nginx + ModSecurity + OWASP CRS
+app/Dockerfile
+FROM php:8.1-fpm
+RUN docker-php-ext-install pdo pdo_pgsql
+WORKDIR /var/www/html
+COPY . /var/www/html
 
-set -e
+app/index.php
+<?php
+// Simple app to list users from PostgreSQL
+$host = getenv('DB_HOST') ?: 'db';
+$db   = 'seguridad_ciudadana';
+$user = 'postgres';
+$pass = 'postgres';
 
-echo "=== Instalando Nginx + ModSecurity ==="
-sudo apt update
-sudo apt install nginx libnginx-mod-http-modsecurity -y
+try {
+    $conn = pg_connect("host=$host dbname=$db user=$user password=$pass");
+    if (!$conn) {
+        throw new Exception("DB connection failed");
+    }
+    $res = pg_query($conn, "SELECT nombre_completo, correo, rol FROM usuarios");
+} catch (Exception $e) {
+    echo "<h2>Error: " . htmlentities($e->getMessage()) . "</h2>";
+    exit;
+}
+?>
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Listado Usuarios</title></head>
+<body>
+<h2>Listado de Usuarios Registrados</h2>
+<table border="1" cellpadding="6">
+<tr><th>Nombre</th><th>Correo</th><th>Rol</th></tr>
+<?php while ($row = pg_fetch_assoc($res)) { ?>
+  <tr>
+    <td><?=htmlspecialchars($row['nombre_completo'])?></td>
+    <td><?=htmlspecialchars($row['correo'])?></td>
+    <td><?=htmlspecialchars($row['rol'])?></td>
+  </tr>
+<?php } ?>
+</table>
+</body>
+</html>
 
-echo "=== Descargando configuración ModSecurity recomendada ==="
-sudo mkdir -p /etc/nginx/modsec
-cd /etc/nginx/modsec
+db/init_db.sql
+CREATE DATABASE seguridad_ciudadana;
+\connect seguridad_ciudadana
 
-sudo wget https://github.com/owasp-modsecurity/ModSecurity/raw/v3/master/modsecurity.conf-recommended -O modsecurity.conf
-sudo wget https://github.com/coreruleset/coreruleset/archive/v4.0.0-rc1.tar.gz
-sudo tar -xzf v4.0.0-rc1.tar.gz
-sudo mv coreruleset-4.0.0-rc1 crs
+CREATE TABLE usuarios (
+    id SERIAL PRIMARY KEY,
+    nombre_completo VARCHAR(100) NOT NULL,
+    correo VARCHAR(100) UNIQUE NOT NULL,
+    rol VARCHAR(50) NOT NULL,
+    fecha_registro TIMESTAMP DEFAULT NOW()
+);
 
-# Activar modo bloqueo
-sudo sed -i 's/SecRuleEngine DetectionOnly/SecRuleEngine On/' modsecurity.conf
+INSERT INTO usuarios (nombre_completo, correo, rol) VALUES
+('Carlos Pérez', 'cperez@demo.gov', 'Administrador'),
+('Ana Gómez', 'agomez@demo.gov', 'Funcionario'),
+('Luis Torres', 'ltorres@demo.gov', 'Ciudadano');
 
-echo "=== Configurando sitio con WAF ==="
-sudo tee /etc/nginx/sites-available/default > /dev/null <<'EOF'
+nginx/nginx.conf
+user  nginx;
+worker_processes  auto;
+events { worker_connections 1024; }
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+    sendfile        on;
+    keepalive_timeout  65;
+
+    # ModSecurity include (path depends on how you install CRS)
+    include /etc/nginx/modsecurity/modsecurity.conf;
+    include /etc/nginx/modsecurity/crs-setup.conf;
+    include /etc/nginx/modsecurity/crs/rules/*.conf;
+
+    server_tokens off;
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        location / {
+            proxy_pass http://web:80;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+    }
+}
+
+nginx/sites-enabled/default.conf
 server {
     listen 80;
     server_name _;
 
-    ModSecurityEnabled on;
-    ModSecurityConfig /etc/nginx/modsec/modsecurity.conf;
-
     location / {
-        proxy_pass http://100.115.31.50;  # IP Tailscale de la VM de aplicación/DB (ajustar)
+        proxy_pass http://web:80;
         proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
     }
 }
-EOF
 
-# Incluir reglas CRS
-sudo tee /etc/nginx/modsec/main.conf > /dev/null <<'EOF'
-Include /etc/nginx/modsec/modsecurity.conf
-Include /etc/nginx/modsec/crs/crs-setup.conf
-Include /etc/nginx/modsec/crs/rules/*.conf
-EOF
+nginx/modsecurity/modsecurity.conf
+# Minimal ModSecurity config for simulation
+# For production, use full modsecurity v3 or distro-provided config
+SecRuleEngine On
+SecRequestBodyAccess On
+SecResponseBodyAccess Off
+SecRule REQUEST_HEADERS:User-Agent "BadBot" "id:1001,phase:1,deny,status:403,msg:'Bad Bot UA'"
 
-sudo nginx -t && sudo systemctl restart nginx
+# Include OWASP CRS rules (if present)
+IncludeOptional /etc/nginx/modsecurity/crs/*.conf
 
-echo "=== Conectando a Tailscale ==="
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up --auth-key=tskey-auth-XXXXXXXXXXXXXXXXXXXXXXXX
-
-echo "WAF activo y conectado a la VPN. ¡Prueba un SQLi!"
-echo "Ejemplo: curl 'http://TU_IP_TAILSCALE/?id=1 OR 1=1-- -'"
-
-
+scripts/ufw-setup.sh
 #!/bin/bash
-# Base de Datos Segura - José Argemiro Romero
-# PostgreSQL con acceso restringido a red Tailscale
-
+# Script para configurar UFW en la VM perimetral (Edwin)
 set -e
 
-echo "=== Instalando PostgreSQL ==="
-sudo apt update
-sudo apt install postgresql postgresql-contrib -y
+echo "[*] Actualizando paquetes..."
+sudo apt update -y
 
-echo "=== Creando base de datos segura ==="
-sudo -u postgres psql -c "CREATE DATABASE appdb;"
-sudo -u postgres psql -c "CREATE USER appuser WITH ENCRYPTED PASSWORD 'S3gur1d4d_2024!';"
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE appdb TO appuser;"
+echo "[*] Instalando UFW..."
+sudo apt install -y ufw
 
-echo "=== Restringiendo acceso solo desde Tailscale (100.0.0.0/8) ==="
-sudo cp /etc/postgresql/*/main/pg_hba.conf /etc/postgresql/*/main/pg_hba.conf.bak
+echo "[*] Habilitando UFW y políticas base..."
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw logging on
 
-sudo tee -a /etc/postgresql/*/main/pg_hba.conf > /dev/null <<EOF
+echo "[*] Permitimos SSH únicamente desde la red Tailscale (100.0.0.0/8)"
+sudo ufw delete allow 22/tcp || true
+sudo ufw allow from 100.0.0.0/8 to any port 22 proto tcp
 
-# Acceso solo desde red Tailscale
-host    all             all             100.0.0.0/8            scram-sha-256
-host    all             all             127.0.0.1/32           scram-sha-256
-EOF
+echo "[*] (Opcional) Si deseas permitir http desde la red interna:"
+# sudo ufw allow from 100.0.0.0/8 to any port 80 proto tcp
 
-sudo systemctl restart postgresql
+echo "[*] Aplicando UFW..."
+sudo ufw --force enable
 
-echo "=== Conectando a Tailscale ==="
+echo "[*] Estado final:"
+sudo ufw status verbose
+Dale permiso de ejecución: chmod +x scripts/ufw-setup.sh
+
+scripts/tailscale-install.sh
+#!/bin/bash
+# Script de ayuda para instalar tailscale en Ubuntu Server
+# Nota: ejecutar en la VM (no dentro del contenedor)
+set -e
+
+echo "[*] Instalando Tailscale..."
 curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up --auth-key=tskey-auth-XXXXXXXXXXXXXXXXXXXXXXXX
 
-echo "Base de datos segura lista. IP Tailscale:"
-tailscale ip -4
+echo "[*] Para conectar esta VM al Tailnet, ejecutar:"
+echo "sudo tailscale up"
+echo
+echo "Si prefieres conectar automáticamente desde el administrador (Auth Key), ejecutar:"
+echo "sudo tailscale up --auth-key=tskey-auth-XXXXXXXXXXXX"
 
+scripts/post-deploy-checks.sh
+#!/bin/bash
+# Comprobaciones rápidas tras despliegue docker
+echo "[*] Contenedores activos:"
+docker-compose ps
+
+echo "[*] Comprobando web (app):"
+curl -sS http://localhost:8080 | head -n 20
+
+echo "[*] Acceso a DB (select):"
+docker exec -it lab-db psql -U postgres -d seguridad_ciudadana -c "select count(*) from usuarios;"
